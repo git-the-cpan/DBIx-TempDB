@@ -18,9 +18,10 @@ no_index:
     - t
     - inc
 requires:
+  DBI: '1.60'
   Mojolicious: '6.00'
 resources:
   bugtracker: https://github.com/jhthorsen/dbix-tempdb/issues
   homepage: https://github.com/jhthorsen/dbix-tempdb
   repository: https://github.com/jhthorsen/dbix-tempdb.git
-version: '0.01'
+version: '0.02'

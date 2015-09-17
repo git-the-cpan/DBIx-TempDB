@@ -6,7 +6,31 @@ DBIx::TempDB - Create a temporary database
 
 =head1 VERSION
 
-0.01
+0.02
+
+=head1 SYNOPSIS
+
+  use Test::More;
+  use DBIx::TempDB;
+  use DBI;
+
+  # create a temp database
+  my $tmpdb = DBIx::TempDB->new("postgresql://postgres@localhost");
+
+  # print complete url to db server with database name
+  diag $tmpdb->url;
+
+  # useful for reading in fixtures
+  $tmpdb->execute("create table users (name text)");
+  $tmpdb->execute_file("path/to/file.sql");
+
+  # connect to the temp database
+  my $db = DBI->connect($tmpdb->dsn);
+
+  # run tests...
+
+  done_testing;
+  # database is cleaned up when test exit
 
 =head1 DESCRIPTION
 
@@ -22,39 +46,22 @@ database to be supported.
 This module is currently EXPERIMENTAL. That means that if any major design
 flaws have been made, they will be fixed without warning.
 
-=head1 SYNOPSIS
-
-  use Test::More;
-  use DBIx::TempDB;
-  use DBI;
-
-  # create a temp database
-  my $tmpdb = DBIx::TempDB->new("postgresql://postgres@localhost");
-
-  # print complete url to db server with database name
-  diag $tmpdb->url;
-
-  # connect to the temp database
-  my $db = DBI->connect($tmpdb->dsn);
-
-  # run tests...
-
-  done_testing;
-  # database is cleaned up when test exit
-
 =cut
 
 use strict;
 use warnings;
 use Carp 'confess';
+use Cwd ();
 use DBI;
 use File::Basename ();
+use File::Spec;
 use Mojo::URL;    # because I can't figure out how to use URI.pm
 use Sys::Hostname ();
 
+use constant CWD => eval { File::Basename::dirname(Cwd::abs_path($0)) };
 use constant MAX_NUMBER_OF_TRIES => $ENV{TEMP_DB_MAX_NUMBER_OF_TRIES} || 20;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 our %SCHEMA_DATABASE = (postgresql => 'postgres', mysql => 'mysql');
 
@@ -65,7 +72,11 @@ our %SCHEMA_DATABASE = (postgresql => 'postgres', mysql => 'mysql');
   $self = $self->create_database;
 
 This method will create a temp database for the current process. Calling this
-method multiple times will simply do nothing.
+method multiple times will simply do nothing. This method is normally
+automatically called by L</new>.
+
+This method will also set C<DBIX_TEMP_DB_URL> to a URL suited for modules
+such as L<Mojo::Pg> and L<Mojo::mysql>.
 
 The database name generated is subject for change, but currently it looks like
 something like this: C<tmp_${UID}_${0}_${HOSTNAME}>.
@@ -76,16 +87,17 @@ sub create_database {
   return $_[0] if $_[0]->{created};
 
   my $self = shift;
-  my $dbi  = DBI->connect($self->_schema_dsn);
+  my $dbh  = DBI->connect($self->_schema_dsn);
   my ($guard, $name);
 
   local $@;
   while (++$guard < MAX_NUMBER_OF_TRIES) {
     $name = $self->_generate_database_name($guard);
-    eval { $dbi->do("create database $name") } or next;
+    eval { $dbh->do("create database $name") } or next;
     $self->{created}++;
     $self->{database_name} = $name;
     $self->{url}->path($name);
+    $ENV{DBIX_TEMP_DB_URL} = $self->{url}->to_string;
     return $self;
   }
 
@@ -95,17 +107,72 @@ sub create_database {
 =head2 dsn
 
   ($dsn, $user, $pass, $attrs) = $self->dsn;
+  ($dsn, $user, $pass, $attrs) = DBIx::TempDB->dsn($url);
 
-Will parse L</url> and return a list of arguments suitable for L<DBI/connect>.
+Will parse L</url> or C<$url>, and return a list of arguments suitable for
+L<DBI/connect>.
 
-Note that this method cannot be called before L</create_database> is called.
+Note that this method cannot be called as an object method before
+L</create_database> is called. You can on the other hand call it as a class
+method, with an L<Mojo::URL> or URL string as input.
 
 =cut
 
 sub dsn {
-  my $self = shift;
-  confess 'Cannot return dsn before create_database() is called.' unless $self->{database_name};
-  $self->can(sprintf '_dsn_for_%s', $self->url->scheme)->($self);
+  my ($self, $url) = @_;
+
+  if (!ref $self and $url) {
+    $url = Mojo::URL->new($url) unless ref $url;
+    $self->can(sprintf '_dsn_for_%s', $url->scheme)->($self, $url, $url->path->parts->[0]);
+  }
+  else {
+    confess 'Cannot return DSN before create_database() is called.' unless $self->{database_name};
+    $self->can(sprintf '_dsn_for_%s', $self->url->scheme)->($self, $self->url, $self->{database_name});
+  }
+}
+
+=head2 execute
+
+  $self = $self->execute($sql);
+
+This method will execute the given C<$sql> statements in the temporary
+SQL server.
+
+=cut
+
+sub execute {
+  my ($self, $sql) = @_;
+  my $dbh = DBI->connect($self->dsn);
+  my $sth = $dbh->prepare($sql);
+  $sth->execute;
+  $self;
+}
+
+=head2 execute_file
+
+  $self = $self->execute_file("relative/to/executable.sql");
+  $self = $self->execute_file("/absolute/path/stmt.sql");
+
+This method will read the contents of a file and execute the SQL statements
+in the temporary server.
+
+This method is a thin wrapper around L</execute>.
+
+=cut
+
+sub execute_file {
+  my ($self, $path) = @_;
+
+  unless (File::Spec->file_name_is_absolute($path)) {
+    confess "Cannot resolve absolute path to '$path'. Something went wrong with Cwd::abs_path($0)." unless CWD;
+    $path = File::Spec->catfile(CWD, split '/', $path);
+  }
+
+  open my $SQL, '<', $path or die "DBIx::TempDB can't open $path: $!";
+  my $ret = my $sql = '';
+  while ($ret = $SQL->sysread(my $buffer, 131072, 0)) { $sql .= $buffer }
+  die qq{DBIx::TempDB can't read from file "$path": $!} unless defined $ret;
+  $self->execute($sql);
 }
 
 =head2 new
@@ -160,16 +227,15 @@ sub DESTROY { $_[0]->{created} and $_[0]->_cleanup }
 
 sub _cleanup {
   my $self = shift;
-  my $dbi  = DBI->connect($self->_schema_dsn);
+  my $dbh  = DBI->connect($self->_schema_dsn);
 
-  $dbi->do("drop database $self->{database_name}");
+  $dbh->do("drop database $self->{database_name}");
 }
 
 sub _dsn_for_postgresql {
-  my $self = shift;
-  my $url  = $self->url;
-  my %opt  = %{$url->query->to_hash};
-  my $dsn  = "dbi:Pg:dbname=$self->{database_name}";
+  my ($class, $url, $database_name) = @_;
+  my %opt = %{$url->query->to_hash};
+  my $dsn = "dbi:Pg:dbname=$database_name";
   my @userinfo;
 
   if (my $host = $url->host) { $dsn .= ";host=$host" }
@@ -186,10 +252,9 @@ sub _dsn_for_postgresql {
 }
 
 sub _dsn_for_mysql {
-  my $self = shift;
-  my $url  = $self->url;
-  my %opt  = %{$url->query->to_hash};
-  my $dsn  = "dbi:mysql:dbname=$self->{database_name}";
+  my ($class, $url, $database_name) = @_;
+  my %opt = %{$url->query->to_hash};
+  my $dsn = "dbi:mysql:dbname=$database_name";
   my @userinfo;
 
   if (my $host = $url->host) { $dsn .= ";host=$host" }

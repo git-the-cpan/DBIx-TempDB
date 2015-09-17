@@ -8,9 +8,11 @@ MANIFEST			This list of files
 README
 t/00-basic.t
 t/database-name.t
+t/execute-file.t
 t/mysql-offline.t
 t/mysql-online.t
 t/pg-offline.t
 t/pg-online.t
+t/users.sql
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)

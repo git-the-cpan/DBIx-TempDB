@@ -19,6 +19,7 @@ WriteMakefile(
 }
 ,
   PREREQ_PM => {
+  'DBI' => '1.60',
   'Mojolicious' => '6.00'
 }
 ,
