@@ -1,5 +1,6 @@
 .perltidyrc
 .ship.conf
+.travis.yml
 Changes
 cpanfile
 lib/DBIx/TempDB.pm
@@ -14,5 +15,6 @@ t/mysql-online.t
 t/pg-offline.t
 t/pg-online.t
 t/users.sql
+t/watch-with-fork.t
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)
