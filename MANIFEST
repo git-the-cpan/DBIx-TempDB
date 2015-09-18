@@ -12,6 +12,7 @@ t/database-name.t
 t/drop-from-child-1.t
 t/drop-from-child-2.t
 t/execute-file.t
+t/keep-database.t
 t/mysql-offline.t
 t/mysql-online.t
 t/pg-offline.t

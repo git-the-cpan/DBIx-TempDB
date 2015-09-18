@@ -8,7 +8,7 @@ DBIx::TempDB - Create a temporary database
 
 =head1 VERSION
 
-0.05
+0.06
 
 =head1 SYNOPSIS
 
@@ -50,6 +50,21 @@ or pull request for more backend support.
 This module is currently EXPERIMENTAL. That means that if any major design
 flaws have been made, they will be fixed without warning.
 
+=head1 ENVIRONMENT VARIABLES
+
+=head2 DBIX_TEMP_DB_KEEP_DATABASE
+
+Setting this variable will disable the core feature in this module:
+A unique database will be created, but it will not get dropped/deleted.
+
+=head2 DBIX_TEMP_DB_URL
+
+This variable is set by L</create_database> and contains the complete
+URL pointing to the temporary database.
+
+Note that calling L</create_database> on different instances of
+L<DBIx::TempDB> will overwrite C<DBIX_TEMP_DB_URL>.
+
 =cut
 
 use strict;
@@ -68,7 +83,7 @@ use constant KILL_SLEEP_INTERVAL => $ENV{DBIX_TEMP_DB_KILL_SLEEP_INTERVAL} || 2;
 use constant MAX_NUMBER_OF_TRIES => $ENV{DBIX_TEMP_DB_MAX_NUMBER_OF_TRIES} || 20;
 use constant MAX_OPEN_FDS => eval { use POSIX qw( sysconf _SC_OPEN_MAX ); sysconf(_SC_OPEN_MAX) } || 1024;
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 our %SCHEMA_DATABASE = (postgresql => 'postgres', mysql => 'mysql');
 
@@ -81,9 +96,6 @@ our %SCHEMA_DATABASE = (postgresql => 'postgres', mysql => 'mysql');
 This method will create a temp database for the current process. Calling this
 method multiple times will simply do nothing. This method is normally
 automatically called by L</new>.
-
-This method will also set C<DBIX_TEMP_DB_URL> to a URL suited for modules
-such as L<Mojo::Pg> and L<Mojo::mysql>.
 
 The database name generate is defined by the L</template> parameter passed to
 L</new>, but normalization will be done to make it work for the given database.
@@ -251,6 +263,8 @@ sub new {
   $self->{template}        ||= 'tmp_%U_%X_%H%i';
   warn "[TempDB:$$] schema_database=$self->{schema_database}\n" if DEBUG;
 
+  $self->{drop_from_child} = 0 if $ENV{DBIX_TEMP_DB_KEEP_DATABASE};
+
   return $self->create_database if $self->{auto_create} // 1;
   return $self;
 }
@@ -259,10 +273,12 @@ sub new {
 
   $url = $self->url;
 
-Returns the input URL as L<URL> object, with L<path|URL/path> set to the temp
-database name.
+Returns the input URL as L<Mojo::URL> compatible object. This URL will have
+the L<path|Mojo::URL/path> part set to the database from L</create_database>,
+but not I<until> after L</create_database> is actually called.
 
-Note that this method cannot be called before L</create_database> is called.
+The URL returned can be passed directly to modules such as L<Mojo::Pg>
+and L<Mojo::mysql>.
 
 =cut
 
@@ -271,6 +287,7 @@ sub url { shift->{url} }
 sub DESTROY {
   my $self = shift;
   return close $self->{DROP_PIPE} if $self->{DROP_PIPE};
+  return                          if $ENV{DBIX_TEMP_DB_KEEP_DATABASE};
   return                          if $self->{double_forked};
   return $self->_cleanup          if $self->{created};
 }
