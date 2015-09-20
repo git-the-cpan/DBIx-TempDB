@@ -8,7 +8,7 @@ DBIx::TempDB - Create a temporary database
 
 =head1 VERSION
 
-0.06
+0.07
 
 =head1 SYNOPSIS
 
@@ -74,8 +74,10 @@ use Cwd ();
 use DBI;
 use File::Basename ();
 use File::Spec;
-use Mojo::URL;    # because I can't figure out how to use URI.pm
+use IO::Handle ();
 use Sys::Hostname ();
+use URI::db;
+use URI::QueryParam;
 
 use constant CWD => eval { File::Basename::dirname(Cwd::abs_path($0)) };
 use constant DEBUG               => $ENV{DBIX_TEMP_DB_DEBUG}               || 0;
@@ -83,9 +85,11 @@ use constant KILL_SLEEP_INTERVAL => $ENV{DBIX_TEMP_DB_KILL_SLEEP_INTERVAL} || 2;
 use constant MAX_NUMBER_OF_TRIES => $ENV{DBIX_TEMP_DB_MAX_NUMBER_OF_TRIES} || 20;
 use constant MAX_OPEN_FDS => eval { use POSIX qw( sysconf _SC_OPEN_MAX ); sysconf(_SC_OPEN_MAX) } || 1024;
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
-our %SCHEMA_DATABASE = (postgresql => 'postgres', mysql => 'mysql');
+our %SCHEMA_DATABASE = (pg => 'postgres', mysql => 'mysql');
+
+my $START_DB_INDEX = 0;
 
 =head1 METHODS
 
@@ -109,15 +113,18 @@ sub create_database {
 
   local $@;
   while (++$guard < MAX_NUMBER_OF_TRIES) {
-    $name = $self->_generate_database_name($guard);
+    $name = $self->_generate_database_name($START_DB_INDEX + $guard);
     eval { $self->_create_database($name) } or next;
-    warn "[TempDB:$$] Created temp database $name\n" if DEBUG;
     $self->{database_name} = $name;
+    warn "[TempDB:$$] Created temp database $name\n" if DEBUG and !$ENV{DBIX_TEMP_DB_KEEP_DATABASE};
+    warn sprintf "[DBIx::TempDB] Created permanent database %s\n", +($self->dsn)[0]
+      if $ENV{DBIX_TEMP_DB_KEEP_DATABASE} and !$ENV{DBIX_TEMP_DB_SILENT};
     $self->_drop_from_child               if $self->{drop_from_child} == 1;
     $self->_drop_from_double_forked_child if $self->{drop_from_child} == 2;
     $self->{created}++;
-    $self->{url}->path($name);
-    $ENV{DBIX_TEMP_DB_URL} = $self->{url}->to_string;
+    $self->{url}->dbname($name);
+    $ENV{DBIX_TEMP_DB_URL} = $self->{url}->uri->as_string;
+    $START_DB_INDEX++;
     return $self;
   }
 
@@ -134,7 +141,7 @@ L<DBI/connect>.
 
 Note that this method cannot be called as an object method before
 L</create_database> is called. You can on the other hand call it as a class
-method, with an L<Mojo::URL> or URL string as input.
+method, with a L<URI::db> or URL string as input.
 
 =cut
 
@@ -142,12 +149,15 @@ sub dsn {
   my ($self, $url) = @_;
 
   if (!ref $self and $url) {
-    $url = Mojo::URL->new($url) unless ref $url;
-    $self->can(sprintf '_dsn_for_%s', $url->scheme)->($self, $url, $url->path->to_string);
+    $url = URI::db->new($url) unless ref $url and $url->isa('URI::_db');
+    unless ($url->has_recognized_engine) {
+      confess "Scheme @{[$url->engine]} is not recognized as a database engine for connection url $url";
+    }
+    $self->can(sprintf '_dsn_for_%s', $url->canonical_engine)->($self, $url, $url->dbname);
   }
   else {
     confess 'Cannot return DSN before create_database() is called.' unless $self->{database_name};
-    $self->can(sprintf '_dsn_for_%s', $self->url->scheme)->($self, $self->url, $self->{database_name});
+    $self->can(sprintf '_dsn_for_%s', $self->url->canonical_engine)->($self, $self->url, $self->{database_name});
   }
 }
 
@@ -250,16 +260,19 @@ The default is subject to change!
 
 sub new {
   my $class   = shift;
-  my $url     = Mojo::URL->new(shift || '');
+  my $url     = URI::db->new(shift || '');
+  unless ($url->has_recognized_engine) {
+    confess "Scheme @{[$url->engine]} is not recognized as a database engine for connection url $url";
+  }
   my $self    = bless {@_, url => $url}, $class;
-  my $dsn_for = sprintf '_dsn_for_%s', $url->scheme || '';
+  my $dsn_for = sprintf '_dsn_for_%s', $url->canonical_engine || '';
 
   unless ($self->can($dsn_for)) {
-    confess "Cannot generate temp database for '@{[$url->scheme]}'. $class\::$dsn_for() is missing";
+    confess "Cannot generate temp database for '@{[$url->canonical_engine]}'. $class\::$dsn_for() is missing";
   }
 
   $self->{drop_from_child} ||= 0;
-  $self->{schema_database} ||= $SCHEMA_DATABASE{$url->scheme};
+  $self->{schema_database} ||= $SCHEMA_DATABASE{$url->canonical_engine};
   $self->{template}        ||= 'tmp_%U_%X_%H%i';
   warn "[TempDB:$$] schema_database=$self->{schema_database}\n" if DEBUG;
 
@@ -273,8 +286,8 @@ sub new {
 
   $url = $self->url;
 
-Returns the input URL as L<Mojo::URL> compatible object. This URL will have
-the L<path|Mojo::URL/path> part set to the database from L</create_database>,
+Returns the input URL as L<URI::db> compatible object. This URL will have
+the L<dbname|URI::db/dbname> part set to the database from L</create_database>,
 but not I<until> after L</create_database> is actually called.
 
 The URL returned can be passed directly to modules such as L<Mojo::Pg>
@@ -282,7 +295,7 @@ and L<Mojo::mysql>.
 
 =cut
 
-sub url { shift->{url} }
+sub url { shift->{url}->uri }
 
 sub DESTROY {
   my $self = shift;
@@ -296,7 +309,7 @@ sub _cleanup {
   my $self = shift;
 
   eval {
-    if ($self->url->scheme eq 'sqlite') {
+    if ($self->url->canonical_engine eq 'sqlite') {
       unlink $self->{database_name} or die $!;
     }
     else {
@@ -311,7 +324,7 @@ sub _cleanup {
 sub _create_database {
   my ($self, $name) = @_;
 
-  if ($self->url->scheme eq 'sqlite') {
+  if ($self->url->canonical_engine eq 'sqlite') {
     require IO::File;
     use Fcntl qw( O_CREAT O_EXCL O_RDWR );
     IO::File->new->open($name, O_CREAT | O_EXCL | O_RDWR) or die "open $name O_CREAT|O_EXCL|O_RDWR: $!\n";
@@ -321,18 +334,17 @@ sub _create_database {
   }
 }
 
-sub _dsn_for_postgresql {
+sub _dsn_for_pg {
   my ($class, $url, $database_name) = @_;
-  my %opt = %{$url->query->to_hash};
+  my %opt = %{$url->query_form_hash};
   my ($dsn, @userinfo);
 
-  $database_name =~ s!^/+!!;
-  $dsn = "dbi:Pg:dbname=$database_name";
-
-  if (my $host = $url->host) { $dsn .= ";host=$host" }
-  if (my $port = $url->port) { $dsn .= ";port=$port" }
-  if (($url->userinfo // '') =~ /^([^:]+)(?::([^:]+))?$/) { @userinfo = ($1, $2) }
-  if (my $service = delete $opt{service}) { $dsn .= "service=$service" }
+  $url = URI::db->new($url);
+  $url->dbname($database_name);
+  $url->query_param_delete($_) for $url->query_param;
+  if (my $service = delete $opt{service}) { $url->query_param(service => $service) }
+  $dsn = $url->dbi_dsn;
+  @userinfo = ($url->user, $url->password);
 
   $opt{AutoCommit}          //= 1;
   $opt{AutoInactiveDestroy} //= 1;
@@ -344,15 +356,14 @@ sub _dsn_for_postgresql {
 
 sub _dsn_for_mysql {
   my ($class, $url, $database_name) = @_;
-  my %opt = %{$url->query->to_hash};
+  my %opt = %{$url->query_form_hash};
   my ($dsn, @userinfo);
 
-  $database_name =~ s!^/+!!;
-  $dsn = "dbi:mysql:dbname=$database_name";
-
-  if (my $host = $url->host) { $dsn .= ";host=$host" }
-  if (my $port = $url->port) { $dsn .= ";port=$port" }
-  if (($url->userinfo // '') =~ /^([^:]+)(?::([^:]+))?$/) { @userinfo = ($1, $2) }
+  $url = URI::db->new($url);
+  $url->dbname($database_name);
+  $url->query_param_delete($_) for $url->query_param;
+  $dsn = $url->dbi_dsn;
+  @userinfo = ($url->user, $url->password);
 
   $opt{AutoCommit}          //= 1;
   $opt{AutoInactiveDestroy} //= 1;
@@ -365,7 +376,12 @@ sub _dsn_for_mysql {
 
 sub _dsn_for_sqlite {
   my ($class, $url, $database_name) = @_;
-  my %opt = %{$url->query->to_hash};
+  my %opt = %{$url->query_form_hash};
+
+  $url = URI::db->new($url);
+  $url->dbname($database_name);
+  $url->query_param_delete($_) for $url->query_param;
+  my $dsn = $url->dbi_dsn;
 
   $opt{AutoCommit}          //= 1;
   $opt{AutoInactiveDestroy} //= 1;
@@ -373,7 +389,7 @@ sub _dsn_for_sqlite {
   $opt{RaiseError}          //= 1;
   $opt{sqlite_unicode}      //= 1;
 
-  return "dbi:SQLite:dbname=$database_name", "", "", \%opt;
+  return $dsn, "", "", \%opt;
 }
 
 sub _generate_database_name {
@@ -403,7 +419,7 @@ sub _generate_database_name {
   $name =~ s!^/+!!;
   $name =~ s!\W!_!g;
 
-  return $name if $self->url->scheme ne 'sqlite';
+  return $name if $self->url->canonical_engine ne 'sqlite';
   return File::Spec->catfile($self->_tempdir, "$name.sqlite");
 }
 
