@@ -8,7 +8,7 @@ DBIx::TempDB - Create a temporary database
 
 =head1 VERSION
 
-0.07
+0.08
 
 =head1 SYNOPSIS
 
@@ -74,7 +74,7 @@ use Cwd ();
 use DBI;
 use File::Basename ();
 use File::Spec;
-use IO::Handle ();
+use IO::Handle    ();
 use Sys::Hostname ();
 use URI::db;
 use URI::QueryParam;
@@ -85,7 +85,7 @@ use constant KILL_SLEEP_INTERVAL => $ENV{DBIX_TEMP_DB_KILL_SLEEP_INTERVAL} || 2;
 use constant MAX_NUMBER_OF_TRIES => $ENV{DBIX_TEMP_DB_MAX_NUMBER_OF_TRIES} || 20;
 use constant MAX_OPEN_FDS => eval { use POSIX qw( sysconf _SC_OPEN_MAX ); sysconf(_SC_OPEN_MAX) } || 1024;
 
-our $VERSION = '0.07';
+our $VERSION = '0.08';
 
 our %SCHEMA_DATABASE = (pg => 'postgres', mysql => 'mysql');
 
@@ -173,8 +173,9 @@ SQL server.
 sub execute {
   my ($self, $sql) = @_;
   my $dbh = DBI->connect($self->dsn);
-  my $sth = $dbh->prepare($sql);
-  $sth->execute;
+  my $parser = $self->can("_parse_@{[$self->url->canonical_engine]}") || sub { $_[1] };
+  local $dbh->{sqlite_allow_multiple_statements} = 1 if $self->url->canonical_engine eq 'sqlite';
+  $dbh->do($_) for $self->$parser($sql);
   $self;
 }
 
@@ -211,7 +212,7 @@ sub execute_file {
   $self = DBIx::TempDB->new($url, %args);
   $self = DBIx::TempDB->new("mysql://127.0.0.1");
   $self = DBIx::TempDB->new("postgresql://postgres@db.example.com");
-  $self = DBIx::TempDB->new("sqlite://");
+  $self = DBIx::TempDB->new("sqlite:");
 
 Creates a new object after checking the C<$url> is valid. C<%args> can be:
 
@@ -221,6 +222,30 @@ Creates a new object after checking the C<$url> is valid. C<%args> can be:
 
 L</create_database> will be called automatically, unless C<auto_create> is
 set to a false value.
+
+=item * create_database_command
+
+Can be set to a custom create database command in the database. The default is
+"create database %d", where %d will be replaced by the generated database name.
+
+For even more control, you can set this to a code ref which will be called like
+this:
+
+  $self->$cb($database_name);
+
+The default is subject to change.
+
+=item * drop_database_command
+
+Can be set to a custom drop database command in the database. The default is
+"drop database %d", where %d will be replaced by the generated database name.
+
+For even more control, you can set this to a code ref which will be called like
+this:
+
+  $self->$cb($database_name);
+
+The default is subject to change.
 
 =item * drop_from_child
 
@@ -259,21 +284,23 @@ The default is subject to change!
 =cut
 
 sub new {
-  my $class   = shift;
-  my $url     = URI::db->new(shift || '');
+  my $class = shift;
+  my $url = URI::db->new(shift || '');
   unless ($url->has_recognized_engine) {
     confess "Scheme @{[$url->engine]} is not recognized as a database engine for connection url $url";
   }
-  my $self    = bless {@_, url => $url}, $class;
+  my $self = bless {@_, url => $url}, $class;
   my $dsn_for = sprintf '_dsn_for_%s', $url->canonical_engine || '';
 
   unless ($self->can($dsn_for)) {
     confess "Cannot generate temp database for '@{[$url->canonical_engine]}'. $class\::$dsn_for() is missing";
   }
 
-  $self->{drop_from_child} ||= 0;
-  $self->{schema_database} ||= $SCHEMA_DATABASE{$url->canonical_engine};
-  $self->{template}        ||= 'tmp_%U_%X_%H%i';
+  $self->{create_database_command} ||= 'create database %d';
+  $self->{drop_database_command}   ||= 'drop database %d';
+  $self->{drop_from_child}         ||= 0;
+  $self->{schema_database}         ||= $SCHEMA_DATABASE{$url->canonical_engine};
+  $self->{template}                ||= 'tmp_%U_%X_%H%i';
   warn "[TempDB:$$] schema_database=$self->{schema_database}\n" if DEBUG;
 
   $self->{drop_from_child} = 0 if $ENV{DBIX_TEMP_DB_KEEP_DATABASE};
@@ -309,11 +336,16 @@ sub _cleanup {
   my $self = shift;
 
   eval {
-    if ($self->url->canonical_engine eq 'sqlite') {
+    if (ref $self->{drop_database_command} eq 'CODE') {
+      $self->{drop_database_command}->($self, $self->{database_name});
+    }
+    elsif ($self->url->canonical_engine eq 'sqlite') {
       unlink $self->{database_name} or die $!;
     }
     else {
-      DBI->connect($self->_schema_dsn)->do("drop database $self->{database_name}");
+      my $sql = $self->{drop_database_command};
+      $sql =~ s!\%d!$self->{database_name}!g;
+      DBI->connect($self->_schema_dsn)->do($sql);
     }
     1;
   } or do {
@@ -324,13 +356,18 @@ sub _cleanup {
 sub _create_database {
   my ($self, $name) = @_;
 
-  if ($self->url->canonical_engine eq 'sqlite') {
+  if (ref $self->{create_database_command} eq 'CODE') {
+    $self->{create_database_command}->($self, $name);
+  }
+  elsif ($self->url->canonical_engine eq 'sqlite') {
     require IO::File;
     use Fcntl qw( O_CREAT O_EXCL O_RDWR );
     IO::File->new->open($name, O_CREAT | O_EXCL | O_RDWR) or die "open $name O_CREAT|O_EXCL|O_RDWR: $!\n";
   }
   else {
-    DBI->connect($self->_schema_dsn)->do("create database $name");
+    my $sql = $self->{create_database_command};
+    $sql =~ s!\%d!$name!g;
+    DBI->connect($self->_schema_dsn)->do($sql);
   }
 }
 
@@ -480,6 +517,59 @@ sub _drop_from_double_forked_child {
   sleep KILL_SLEEP_INTERVAL while kill 0, $ppid;
   $self->_cleanup;
   exit 0;
+}
+
+sub _parse_mysql {
+  my ($self, $sql) = @_;
+  my ($new, $last, $delimiter) = (1, '', ';');
+  my @commands;
+
+  while (length($sql) > 0) {
+    my $token;
+
+    if ($sql =~ /^$delimiter/x) {
+      ($new, $token) = (1, $delimiter);
+    }
+    elsif ($sql =~ /^delimiter\s+(\S+)\s*(?:\n|\z)/ip) {
+      ($new, $token, $delimiter) = (1, ${^MATCH}, $1);
+    }
+    elsif (
+      $sql =~ /^(\s+)/s    # whitespace
+      or $sql =~ /^(\w+)/
+      )
+    {                      # general name
+      $token = $1;
+    }
+    elsif (
+      $sql =~ /^--.*(?:\n|\z)/p                                # double-dash comment
+      or $sql =~ /^\#.*(?:\n|\z)/p                             # hash comment
+      or $sql =~ /^\/\*(?:[^\*]|\*[^\/])*(?:\*\/|\*\z|\z)/p    # C-style comment
+      or $sql =~ /^'(?:[^'\\]*|\\(?:.|\n)|'')*(?:'|\z)/p       # single-quoted literal text
+      or $sql =~ /^"(?:[^"\\]*|\\(?:.|\n)|"")*(?:"|\z)/p       # double-quoted literal text
+      or $sql =~ /^`(?:[^`]*|``)*(?:`|\z)/p
+      )
+    {                                                          # schema-quoted literal text
+      $token = ${^MATCH};
+    }
+    else {
+      $token = substr($sql, 0, 1);
+    }
+
+    # chew token
+    substr $sql, 0, length($token), '';
+
+    if ($new) {
+      push @commands, $last if $last !~ /^\s*$/s;
+      ($new, $last) = (0, '');
+    }
+    else {
+      $last .= $token;
+    }
+  }
+
+  push @commands, $last if $last !~ /^\s*$/s;
+
+  return @commands;
 }
 
 sub _schema_dsn {
