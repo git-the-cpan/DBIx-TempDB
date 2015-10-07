@@ -8,7 +8,7 @@ DBIx::TempDB - Create a temporary database
 
 =head1 VERSION
 
-0.08
+0.09
 
 =head1 SYNOPSIS
 
@@ -16,8 +16,11 @@ DBIx::TempDB - Create a temporary database
   use DBIx::TempDB;
   use DBI;
 
+  # provide credentials with environment variables
+  plan skip_all => 'TEST_PG_DSN=postgresql://postgres@localhost' unless $ENV{TEST_PG_DSN};
+
   # create a temp database
-  my $tmpdb = DBIx::TempDB->new("postgresql://postgres@localhost");
+  my $tmpdb = DBIx::TempDB->new($ENV{TEST_PG_DSN});
 
   # print complete url to db server with database name
   diag $tmpdb->url;
@@ -49,6 +52,15 @@ or pull request for more backend support.
 
 This module is currently EXPERIMENTAL. That means that if any major design
 flaws have been made, they will be fixed without warning.
+
+=head1 CAVEAT
+
+Creating a database is easy, but making sure it gets clean up when your
+process exit is a totally different ball game. This means that
+L<DBIx::TempDB> might fill up your server with random databases, unless
+you choose the right "drop strategy". Have a look at the L</drop_from_child>
+parameter you can give to L</new> and test the different values and select
+the one that works for you.
 
 =head1 ENVIRONMENT VARIABLES
 
@@ -85,11 +97,9 @@ use constant KILL_SLEEP_INTERVAL => $ENV{DBIX_TEMP_DB_KILL_SLEEP_INTERVAL} || 2;
 use constant MAX_NUMBER_OF_TRIES => $ENV{DBIX_TEMP_DB_MAX_NUMBER_OF_TRIES} || 20;
 use constant MAX_OPEN_FDS => eval { use POSIX qw( sysconf _SC_OPEN_MAX ); sysconf(_SC_OPEN_MAX) } || 1024;
 
-our $VERSION = '0.08';
-
+our $VERSION = '0.09';
 our %SCHEMA_DATABASE = (pg => 'postgres', mysql => 'mysql');
-
-my $START_DB_INDEX = 0;
+my $N = 0;
 
 =head1 METHODS
 
@@ -113,7 +123,7 @@ sub create_database {
 
   local $@;
   while (++$guard < MAX_NUMBER_OF_TRIES) {
-    $name = $self->_generate_database_name($START_DB_INDEX + $guard);
+    $name = $self->_generate_database_name($N + $guard);
     eval { $self->_create_database($name) } or next;
     $self->{database_name} = $name;
     warn "[TempDB:$$] Created temp database $name\n" if DEBUG and !$ENV{DBIX_TEMP_DB_KEEP_DATABASE};
@@ -124,7 +134,7 @@ sub create_database {
     $self->{created}++;
     $self->{url}->dbname($name);
     $ENV{DBIX_TEMP_DB_URL} = $self->{url}->uri->as_string;
-    $START_DB_INDEX++;
+    $N++;
     return $self;
   }
 
@@ -475,12 +485,16 @@ sub _drop_from_child {
   return $self->{drop_pid} = $pid if $pid;
 
   # child
+  $DB::CreateTTY = 0;    # prevent debugger from creating terminals
+  $SIG{$_} = sub { $self->_cleanup; exit; }
+    for qw( INT QUIT TERM );
+
   for (0 .. MAX_OPEN_FDS - 1) {
     next if fileno($READ) == $_;
+    next if DEBUG and fileno(STDERR) == $_;
     POSIX::close($_);
   }
 
-  $DB::CreateTTY = 0;    # prevent debugger from creating terminals
   warn "[TempDB:$$] Waiting for $ppid to end\n" if DEBUG;
   1 while <$READ>;
   $self->_cleanup;
