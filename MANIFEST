@@ -18,6 +18,7 @@ t/execute-file.t
 t/keep-database.t
 t/mysql-offline.t
 t/mysql-online.t
+t/parse-mysql.t
 t/pg-offline.t
 t/pg-online.t
 t/sqlite-offline.t
